@@ -1,0 +1,42 @@
+# docker-compose.yml
+version: '3.8' # Specify the Docker Compose file format version
+
+services:
+  # MongoDB service
+  mongodb:
+    image: mongo:latest # Use the latest official MongoDB image
+    container_name: chat-mongodb
+    ports:
+      - "27017:27017" # Map container port 27017 to host port 27017
+    volumes:
+      - mongodb_data:/data/db # Persist MongoDB data to a named volume
+    environment:
+      # Optional: MongoDB authentication (highly recommended for production)
+      # MONGO_INITDB_ROOT_USERNAME: your_mongo_user
+      # MONGO_INITDB_ROOT_PASSWORD: your_mongo_password
+      # For this setup, we'll keep it simple without auth, matching your current MONGO_URI
+      # If you add auth, remember to update your MONGO_URI in the Node.js app service below.
+      - MONGO_URI=mongodb://mongodb:27017/customer_service_chat # Internal network URI for the app to connect to
+
+  # Node.js application service
+  app:
+    build: . # Build the image from the Dockerfile in the current directory
+    container_name: chat-app
+    ports:
+      - "3000:3000" # Map container port 3000 to host port 3000
+    volumes:
+      - .:/app # Mount the current host directory into the container. Useful for development.
+      - /app/node_modules # Explicitly declare node_modules as a separate volume (avoids host node_modules interfering)
+    environment:
+      # Pass environment variables needed by your Node.js application
+      # Ensure MONGO_URI matches the MongoDB service name
+      MONGO_URI: mongodb://mongodb:27017/customer_service_chat # Use the service name 'mongodb' as the host
+      JWT_SECRET: your_super_secret_jwt_key_for_agents # **IMPORTANT: REPLACE WITH A SECURE SECRET**
+      PORT: 3000
+    depends_on:
+      - mongodb # Ensure MongoDB starts before the app
+    command: npm start # Or 'node server.js' if you don't have a start script in package.json
+
+# Define named volumes for data persistence
+volumes:
+  mongodb_data:
