@@ -1,0 +1,41 @@
+<!-- public/customer_chat.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Your Live Chat</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<div class="chat-container">
+    <div class="chat-header">
+        <span>Live Chat with <span id="agentName">Support Agent</span></span>
+        <button id="endChatButton">End Chat</button>
+    </div>
+    <div class="messages" id="messages">
+        <!-- Chat messages will be appended here -->
+    </div>
+    <div class="message-input-area">
+        <input type="text" id="messageInput" placeholder="Type your message..." autofocus>
+        <button id="sendMessageButton">Send</button>
+    </div>
+</div>
+
+<div class="container" id="queueInfo" style="display: none;">
+    <h2>Waiting for an Agent...</h2>
+    <p>You are currently <span id="queuePosition"></span> in the queue.</p>
+    <p>Please do not close this window.</p>
+    <button id="cancelQueueButton">Cancel Chat</button>
+</div>
+
+<div class="container" id="chatEndedInfo" style="display: none;">
+    <h2>Chat Ended</h2>
+    <p id="chatEndedMessage"></p>
+    <button onclick="window.location.href='/customer_index.html'">Start New Chat</button>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/customer_script.js"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+<!-- public/customer_index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Customer Service Chat</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<div class="container">
+    <h2>Welcome to Customer Support</h2>
+    <h3>Start a New Chat</h3>
+    <form id="chatRequestForm">
+        <input type="text" id="customerName" placeholder="Your Name" required>
+        <input type="email" id="customerEmail" placeholder="Your Email (Optional)">
+        <textarea id="topic" placeholder="Briefly describe your issue..." rows="3" required></textarea>
+        <button type="submit">Start Chat</button>
+    </form>
+    <p id="message"></p>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/customer_script.js"></script>
+</body>
+</html>

@@ -1,0 +1,56 @@
+<!-- public/agent_dashboard.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent Dashboard</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<div class="dashboard-layout">
+    <div class="sidebar">
+        <h3>Agent: <span id="agentUsername"></span></h3>
+        <p>ID: <span id="agentId"></span></p>
+
+        <div class="agent-status-controls">
+            <p>My Status: <span id="myAgentStatus">Unavailable</span></p>
+            <button id="setAvailableBtn" class="status-button">Set Available</button>
+            <button id="setUnavailableBtn" class="status-button">Set Unavailable</button>
+        </div>
+
+        <h4>Pending & Active Chats</h4>
+        <div class="chat-list">
+            <ul id="chatSessionsList">
+                <!-- Chat sessions will be loaded here -->
+            </ul>
+        </div>
+        <button onclick="logoutAgent()">Logout</button>
+    </div>
+
+    <div class="main-content">
+        <h2 id="welcomeHeader">Welcome to your Dashboard!</h2>
+        <div class="agent-chat-area" id="agentChatArea" style="display: none;">
+            <div class="agent-chat-header">
+                <span id="currentChatCustomerName"></span>
+                <button id="closeChatButton">End Chat</button>
+            </div>
+            <div class="agent-chat-messages" id="agentChatMessages">
+                <!-- Agent chat messages here -->
+            </div>
+            <div class="agent-message-input-area">
+                <input type="text" id="agentMessageInput" placeholder="Type message to customer..." autofocus>
+                <button id="sendAgentMessageButton">Send</button>
+            </div>
+        </div>
+        <div id="noChatSelected" style="text-align: center; margin-top: 50px; font-size: 1.2em; color: #555;">
+            <p>Select a chat from the sidebar to start interacting.</p>
+            <p>Set your status to "Available" to receive new chats.</p>
+        </div>
+    </div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/agent_script.js"></script>
+</body>
+</html>
