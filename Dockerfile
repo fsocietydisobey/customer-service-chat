@@ -1,6 +1,6 @@
 # Use an official Node.js runtime as a parent image
 # Using a specific version (e.g., 18-alpine or 20-alpine) is good practice for stability
-FROM node:24-alpine # Updated to Node.js v24
+FROM node:24-alpine
 
 # Set the working directory in the container
 WORKDIR /app
