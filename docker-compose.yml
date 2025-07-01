@@ -1,5 +1,4 @@
 # docker-compose.yml
-version: '3.8' # Specify the Docker Compose file format version
 
 services:
   # MongoDB service
@@ -21,6 +20,7 @@ services:
   # Node.js application service
   app:
     build: . # Build the image from the Dockerfile in the current directory
+    image: fsocietydisobey/customer-chat-app:v1.0 # NEW: Explicitly name and tag the built image
     container_name: chat-app
     ports:
       - "3000:3000" # Map container port 3000 to host port 3000
