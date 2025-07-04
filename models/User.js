@@ -24,7 +24,7 @@ const UserSchema = new mongoose.Schema({
 	},
 	status: { // Added: Agent availability status: 'available', 'unavailable', 'chatting'
 		type: String,
-		enum: ['available', 'unavailable', 'chatting'],
+		enum: ['available', 'unavailable', 'chatting'], // 'chatting' implies they are in at least one chat
 		default: 'unavailable', // Agents start as unavailable
 	},
 	createdAt: {

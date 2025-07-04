@@ -265,6 +265,60 @@ button:active {
     color: #bdc3c7;
 }
 
+/* NEW: Styles for agent list in chat header */
+.agent-list-dropdown {
+    position: relative;
+    display: inline-block;
+}
+
+.agent-list-dropdown button {
+    background-color: #17a2b8;
+    color: white;
+    padding: 8px 15px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 0.9em;
+    margin-left: 10px;
+    margin-top: 0; /* Override default button margin-top */
+    box-shadow: none;
+}
+.agent-list-dropdown button:hover {
+    background-color: #138496;
+}
+
+.agent-list-dropdown-content {
+    display: none;
+    position: absolute;
+    background-color: #f9f9f9;
+    min-width: 160px;
+    box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.2);
+    z-index: 1;
+    border-radius: 8px;
+    right: 0; /* Align to the right of the button */
+    top: 100%; /* Position below the button */
+    margin-top: 5px; /* Small gap */
+}
+
+.agent-list-dropdown-content a {
+    color: black;
+    padding: 12px 16px;
+    text-decoration: none;
+    display: block;
+    text-align: left;
+    font-size: 0.9em;
+}
+
+.agent-list-dropdown-content a:hover {
+    background-color: #ddd;
+    border-radius: 8px;
+}
+
+.agent-list-dropdown.show .agent-list-dropdown-content {
+    display: block;
+}
+
+
 .main-content {
     flex-grow: 1;
     display: flex;

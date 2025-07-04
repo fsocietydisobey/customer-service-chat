@@ -32,7 +32,16 @@
         <h2 id="welcomeHeader">Welcome to your Dashboard!</h2>
         <div class="agent-chat-area" id="agentChatArea" style="display: none;">
             <div class="agent-chat-header">
-                <span id="currentChatCustomerName"></span>
+                <span>Chat with <span id="currentChatCustomerName"></span></span>
+                <!-- NEW: Agent list dropdown -->
+                <div class="agent-list-dropdown">
+                    <button id="inviteAgentBtn">Invite Agent</button>
+                    <div class="agent-list-dropdown-content" id="otherAgentsDropdown">
+                        <!-- Other agents will be loaded here dynamically by agent_script.js -->
+                        <!-- Removed hardcoded agents -->
+                    </div>
+                </div>
+                <button id="leaveChatButton" style="background-color: #ffc107;">Leave Chat</button> <!-- NEW: Leave Chat -->
                 <button id="closeChatButton">End Chat</button>
             </div>
             <div class="agent-chat-messages" id="agentChatMessages">

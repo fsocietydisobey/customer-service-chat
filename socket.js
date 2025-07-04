@@ -1,68 +1,105 @@
+// socket.js
 const User = require('./models/User');
 const ChatSession = require('./models/ChatSession');
 const Message = require('./models/Message');
 
-module.exports = (io) => {
-	// --- Socket.IO Logic ---
+// In-memory data structures for managing connections and queues
+let customerQueue = []; // Array of { customerSocketId, sessionId, customerId, customerName, customerEmail, topic }
+const customerSockets = new Map(); // customerId -> socket.id (for anonymous customers)
+const agentSockets = new Map(); // agentId -> Set of socket.ids (for agents, allowing multiple tabs)
 
-	// In-memory data structures for managing connections and queues
-	let customerQueue = []; // Array of { customerSocketId, sessionId, customerId, customerName, customerEmail, topic }
-	const customerSockets = new Map(); // customerId -> socket.id (for anonymous customers)
-	const agentSockets = new Map(); // agentId -> Set of socket.ids (for agents, allowing multiple tabs)
+// Helper function to find an available agent
+const findAvailableAgent = async () => {
+	const availableAgent = await User.findOne({
+		role: 'agent',
+		status: 'available',
+		isOnline: true // Must be online and available
+	});
+	return availableAgent;
+};
 
-	// Helper function to find an available agent
-	const findAvailableAgent = async () => {
-		const availableAgent = await User.findOne({
-			role: 'agent',
-			status: 'available',
-			isOnline: true // Must be online and available
-		});
-		return availableAgent;
-	};
+// Helper to update agent status based on active chats
+const updateAgentStatusBasedOnChats = async (io, agentId) => { // Pass io instance
+	const activeAssignedChatsCount = await ChatSession.countDocuments({
+		agentIds: agentId, // Check if agentId is in the agentIds array
+		status: 'assigned'
+	});
 
+	const currentAgent = await User.findById(agentId);
+	if (!currentAgent) return;
+
+	let newStatus = currentAgent.status;
+	if (activeAssignedChatsCount > 0 && currentAgent.status !== 'chatting') {
+		newStatus = 'chatting';
+	} else if (activeAssignedChatsCount === 0 && currentAgent.status === 'chatting') {
+		newStatus = 'available'; // Or 'unavailable' if they set it manually
+	}
+
+	if (newStatus !== currentAgent.status) {
+		await User.findByIdAndUpdate(agentId, {status: newStatus});
+		io.to('agents').emit('agent:status_updated', {userId: agentId, status: newStatus});
+		console.log(`[Status Update Helper] Agent ${currentAgent.username} (${agentId}) status updated to: ${newStatus}`);
+	}
+};
+
+
+module.exports = (io) => { // Export a function that takes the io instance
 	io.on('connection', (socket) => {
 		console.log(`New connection: ${socket.id}`);
 
 		// --- Customer Side Events ---
 		socket.on('customer:request_chat', async ({customerName, customerEmail, topic}) => {
-			// Generate a unique customerId for this session (could be a UUID)
+			console.log(`[Customer Request] Customer ${customerName} requesting chat.`);
 			const customerId = `customer_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-			socket.customerId = customerId; // Store customerId on socket for easy reference
-			customerSockets.set(customerId, socket.id); // Map customerId to their current socket ID
+			socket.customerId = customerId;
+			customerSockets.set(customerId, socket.id);
 
 			let session;
 			let assignedAgent = await findAvailableAgent();
-			console.log('assigned agent', assignedAgent)
+
 			if (assignedAgent) {
-				// Agent available, create and assign session
 				session = new ChatSession({
 					customerId,
 					customerName,
 					customerEmail,
 					topic,
-					agentId: assignedAgent._id,
-					agentUsername: assignedAgent.username,
+					agentIds: [assignedAgent._id], // Store as array
+					agentUsernames: [assignedAgent.username], // Store as array
 					status: 'assigned',
 				});
+				// Ensure arrays are initialized even if Mongoose acts weirdly
+				session.agentIds = session.agentIds || [];
+				session.agentUsernames = session.agentUsernames || [];
+
 				await session.save();
+				console.log(`[Customer Request] New session ${session._id} created with initial agent: ${assignedAgent.username}`);
+				console.log(`[Customer Request] Session agentIds: ${session.agentIds}, agentUsernames: ${session.agentUsernames}`);
 
-				// Update agent's status to 'chatting' in DB
-				await User.findByIdAndUpdate(assignedAgent._id, {status: 'chatting'});
-				io.to('agents').emit('agent:status_updated', {userId: assignedAgent._id, status: 'chatting'});
+				// NEW: Save customer's initial message to DB
+				const initialMessage = new Message({
+					chatSession: session._id,
+					senderId: customerId,
+					senderRole: 'customer',
+					content: topic, // Use the topic as the initial message content
+				});
+				await initialMessage.save();
+				console.log(`[Customer Request] Initial message saved for session ${session._id}: "${topic}"`);
 
 
-				// Join the socket to a room specific to this chat session
+				await updateAgentStatusBasedOnChats(io, assignedAgent._id);
+
+				// FIXED: Customer's socket joins the room immediately upon session creation
 				socket.join(session._id.toString());
-				// Emit to customer that chat is assigned
-				// FIXED: Include customerId in the emitted event
+				console.log(`[Customer Request] Customer socket ${socket.id} joined room ${session._id.toString()}.`);
+
 				socket.emit('chat:assigned', {
 					sessionId: session._id,
-					agentName: assignedAgent.username,
+					agentNames: session.agentUsernames,
 					customerId: customerId
 				});
+				console.log(`[Customer Request] Emitted chat:assigned to customer ${customerId} with agentNames: ${session.agentUsernames}`);
 
-				// Notify the assigned agent
-				// Find ALL sockets for this agent (as agentSockets map userId to Set of socketIds)
+
 				if (agentSockets.has(assignedAgent._id.toString())) {
 					agentSockets.get(assignedAgent._id.toString()).forEach(agentSocketId => {
 						io.to(agentSocketId).emit('agent:chat_assigned_to_me', {
@@ -70,15 +107,21 @@ module.exports = (io) => {
 							customerName: customerName,
 							topic: topic
 						});
-						// Agent's socket joins the session room
 						io.sockets.sockets.get(agentSocketId)?.join(session._id.toString());
+						console.log(`[Customer Request] Emitted agent:chat_assigned_to_me to agent socket ${agentSocketId}`);
 					});
 				}
-
-
 				console.log(`Chat session ${session._id} assigned to agent ${assignedAgent.username}`);
+
+				io.to('agents').emit('agent:session_status_changed', {
+					sessionId: session._id,
+					newStatus: 'assigned',
+					agentIds: session.agentIds,
+					agentUsernames: session.agentUsernames
+				});
+				console.log(`[Customer Request] Broadcast agent:session_status_changed to all agents for session ${session._id}`);
+
 			} else {
-				// No agent available, add to queue
 				session = new ChatSession({
 					customerId,
 					customerName,
@@ -95,182 +138,206 @@ module.exports = (io) => {
 					customerEmail,
 					topic
 				});
+				console.log(`[Customer Request] No agent available. Session ${session._id} added to queue.`);
 
-				// FIXED: Include customerId in the emitted event
+				// NEW: Save customer's initial message to DB even if queued
+				const initialMessage = new Message({
+					chatSession: session._id,
+					senderId: customerId,
+					senderRole: 'customer',
+					content: topic,
+				});
+				await initialMessage.save();
+				console.log(`[Customer Request] Initial message saved for queued session ${session._id}: "${topic}"`);
+
+				// FIXED: Customer's socket joins the room immediately upon session creation, even if queued
+				socket.join(session._id.toString());
+				console.log(`[Customer Request] Customer socket ${socket.id} joined room ${session._id.toString()} (queued).`);
+
+
 				socket.emit('chat:queued', {
 					position: customerQueue.length,
 					sessionId: session._id,
 					customerId: customerId
 				});
-				console.log(`Customer ${customerName} added to queue. Position: ${customerQueue.length}`);
-				// Notify all connected agents about new pending chat request
+				console.log(`[Customer Request] Emitted chat:queued to customer ${customerId}`);
+
 				io.to('agents').emit('agent:new_queue_item', {sessionId: session._id, customerName});
+				console.log(`[Customer Request] Broadcast agent:new_queue_item to all agents for session ${session._id}`);
 			}
 		});
 
-		// Customer sending message
 		socket.on('customer:message', async ({sessionId, content}) => {
-			if (!socket.customerId) return; // Must have an active customer session
+			console.log(`[Customer Message] Received message for session ${sessionId} from customer ${socket.customerId}: ${content}`);
+			if (!socket.customerId) return;
 
 			try {
 				const chatSession = await ChatSession.findById(sessionId);
-				// Ensure customer is part of this session and it's assigned
-				if (!chatSession || chatSession.customerId !== socket.customerId || chatSession.status !== 'assigned') {
-					console.warn(`Customer ${socket.customerId} tried to send message to invalid/unassigned session ${sessionId}`);
+				// Defensive initialization after fetch
+				chatSession.agentIds = chatSession.agentIds || [];
+				chatSession.agentUsernames = chatSession.agentUsernames || [];
+
+				// FIXED: Allow messages if status is 'pending', 'in_queue' or 'assigned'
+				if (!chatSession || chatSession.customerId !== socket.customerId || !(chatSession.status === 'assigned' || chatSession.status === 'in_queue' || chatSession.status === 'pending')) {
+					console.warn(`[Customer Message] Customer ${socket.customerId} tried to send message to invalid/unassigned/non-active session ${sessionId} (status: ${chatSession?.status}).`);
 					return;
 				}
 
 				const newMessage = new Message({
 					chatSession: sessionId,
-					senderId: socket.customerId, // Customer's unique ID for the session
+					senderId: socket.customerId,
 					senderRole: 'customer',
 					content,
 				});
 				await newMessage.save();
+				console.log(`[Customer Message] Message saved: ${newMessage._id}`);
 
-				// Emit message to everyone in the chat session room (customer and agent)
+
 				io.to(sessionId).emit('chat:message', {
 					sessionId,
 					senderId: socket.customerId,
 					senderRole: 'customer',
 					content,
 					timestamp: newMessage.timestamp,
+					senderUsername: chatSession.customerName // NEW: Include sender's username
 				});
+				console.log(`[Customer Message] Emitted chat:message to room ${sessionId}`);
+
 			} catch (error) {
-				console.error('Error saving customer message:', error);
+				console.error('[Customer Message] Error saving customer message:', error);
 			}
 		});
 
-		// Customer decides to end the chat (after it's assigned)
 		socket.on('customer:close_chat_request', async ({sessionId}) => {
+			console.log(`[Customer Close] Customer ${socket.customerId} requesting to close session ${sessionId}`);
 			if (!socket.customerId) return;
 			try {
 				const chatSession = await ChatSession.findById(sessionId);
+				// Defensive initialization after fetch
+				chatSession.agentIds = chatSession.agentIds || [];
+				chatSession.agentUsernames = chatSession.agentUsernames || [];
+
 				if (!chatSession || chatSession.customerId !== socket.customerId || chatSession.status === 'closed') {
-					console.warn(`Customer ${socket.customerId} tried to close invalid/already closed session ${sessionId}`);
+					console.warn(`[Customer Close] Customer ${socket.customerId} tried to close invalid/already closed session ${sessionId}`);
 					return;
 				}
 
 				chatSession.status = 'closed';
 				chatSession.endedAt = Date.now();
 				await chatSession.save();
+				console.log(`[Customer Close] Session ${sessionId} status updated to closed.`);
 
-				// Remove customer socket from the session room
+
 				socket.leave(sessionId);
-				// Notify agent if assigned
-				if (chatSession.agentId) {
-					// Find all sockets for the agent and remove them from the room
-					if (agentSockets.has(chatSession.agentId.toString())) {
-						agentSockets.get(chatSession.agentId.toString()).forEach(agentSocketId => {
-							io.sockets.sockets.get(agentSocketId)?.leave(sessionId);
-						});
-					}
-				}
-
-				// Emit to both customer and agent that session is closed
 				io.to(sessionId).emit('chat:session_closed', {sessionId: sessionId, reason: 'customer_closed'});
-				socket.emit('chat:session_closed', {sessionId: sessionId, reason: 'customer_closed'}); // Ensure customer gets it too
-				// Broadcast to all agents for dashboard update
+				socket.emit('chat:session_closed', {sessionId: sessionId, reason: 'customer_closed'});
+				console.log(`[Customer Close] Emitted chat:session_closed to room ${sessionId} and customer.`);
+
 				io.to('agents').emit('agent:session_closed_broadcast', {sessionId: sessionId});
+				console.log(`[Customer Close] Broadcast agent:session_closed_broadcast for ${sessionId}`);
 
-				// Update agent's status if they were only chatting with this customer
-				const activeAssignedChats = await ChatSession.countDocuments({
-					agentId: chatSession.agentId,
-					status: 'assigned'
-				});
-				if (activeAssignedChats === 0 && chatSession.agentId) { // Only change status if no other active chats
-					await User.findByIdAndUpdate(chatSession.agentId, {status: 'available'});
-					io.to('agents').emit('agent:status_updated', {userId: chatSession.agentId, status: 'available'});
-				} else if (chatSession.agentId) {
-					// Agent might still be chatting with others, keep status as 'chatting'
-					io.to('agents').emit('agent:status_updated', {userId: chatSession.agentId, status: 'chatting'});
+
+				for (const agentId of chatSession.agentIds) {
+					await updateAgentStatusBasedOnChats(io, agentId);
 				}
-
 
 				console.log(`Chat session ${sessionId} closed by customer ${socket.customerId}`);
-				customerSockets.delete(chatSession.customerId); // Remove customer from active map
+				customerSockets.delete(chatSession.customerId);
 
 			} catch (error) {
-				console.error('Error closing chat session by customer:', error);
+				console.error('[Customer Close] Error closing chat session by customer:', error);
 			}
 		});
 
-		// Customer cancels their request while in queue
 		socket.on('customer:cancel_queue', async ({sessionId}) => {
+			console.log(`[Customer Cancel Queue] Customer ${socket.customerId} cancelling queue for session ${sessionId}`);
 			if (!socket.customerId) return;
 			try {
 				const chatSession = await ChatSession.findById(sessionId);
+				// Defensive initialization after fetch
+				chatSession.agentIds = chatSession.agentIds || [];
+				chatSession.agentUsernames = chatSession.agentUsernames || [];
+
 				if (!chatSession || chatSession.customerId !== socket.customerId || chatSession.status !== 'in_queue') {
-					console.warn(`Customer ${socket.customerId} tried to cancel invalid/not-in-queue session ${sessionId}`);
+					console.warn(`[Customer Cancel Queue] Customer ${socket.customerId} tried to cancel invalid/not-in-queue session ${sessionId}`);
 					return;
 				}
 
-				// Remove from in-memory queue
 				const initialQueueLength = customerQueue.length;
 				customerQueue = customerQueue.filter(item => item.sessionId.toString() !== sessionId);
 				if (customerQueue.length < initialQueueLength) {
-					io.to('agents').emit('agent:queue_updated', {}); // Notify agents queue changed
-					console.log(`Customer ${socket.customerId} removed from in-memory queue on cancel.`);
+					io.to('agents').emit('agent:queue_updated', {});
+					console.log(`[Customer Cancel Queue] Broadcast agent:queue_updated`);
 				}
 
-				// Update session status in DB
 				chatSession.status = 'closed';
 				chatSession.endedAt = Date.now();
 				await chatSession.save();
+				console.log(`[Customer Cancel Queue] Session ${sessionId} status updated to closed.`);
+
 
 				socket.emit('chat:session_closed', {sessionId: sessionId, reason: 'customer_cancelled_queue'});
-				io.to('agents').emit('agent:session_closed_broadcast', {sessionId: sessionId}); // Update agents dashboard
+				io.to('agents').emit('agent:session_closed_broadcast', {sessionId: sessionId});
+				console.log(`[Customer Cancel Queue] Emitted chat:session_closed and agent:session_closed_broadcast for ${sessionId}`);
+
 				customerSockets.delete(chatSession.customerId);
 
 				console.log(`Customer ${socket.customerId} cancelled chat request ${sessionId} from queue.`);
 
 			} catch (error) {
-				console.error('Error cancelling queued chat:', error);
+				console.error('[Customer Cancel Queue] Error cancelling queued chat:', error);
 			}
 		});
 
 
 		// --- Agent Side Events ---
 		socket.on('agent:authenticate', async (agentId) => {
-			socket.agentId = agentId; // Store agentId on socket
-			socket.join('agents'); // Agents join a common room for broadcasts
+			console.log(`[Agent Auth] Agent ${agentId} attempting to authenticate.`);
+			socket.agentId = agentId;
+			socket.join('agents'); // All agents join a common 'agents' room
 
 			if (!agentSockets.has(agentId)) {
 				agentSockets.set(agentId, new Set());
 			}
 			agentSockets.get(agentId).add(socket.id);
+			console.log(`[Agent Auth] Agent ${agentId} sockets: ${agentSockets.get(agentId).size}`);
 
-			// Fetch agent's status from DB and update socket status
+
 			const agent = await User.findById(agentId);
 			if (agent) {
-				await User.findByIdAndUpdate(agentId, {isOnline: true}); // Mark agent as online
-				console.log(`Agent ${agent.username} (${agentId}) authenticated with socket ${socket.id}`);
-				// Send initial dashboard data (e.g., pending chats)
+				await User.findByIdAndUpdate(agentId, {isOnline: true});
+				console.log(`[Agent Auth] Agent ${agent.username} (${agentId}) authenticated with socket ${socket.id}`);
+
 				const pendingAndAssignedChats = await ChatSession.find({
 					$or: [
 						{status: 'in_queue'},
-						{agentId: agentId, status: 'assigned'}
+						{agentIds: agentId, status: 'assigned'}
 					]
 				}).sort({startedAt: 1});
 				socket.emit('agent:initial_dashboard_data', {
 					pendingAndAssignedChats,
 					agentStatus: agent.status
 				});
+				console.log(`[Agent Auth] Emitted agent:initial_dashboard_data to agent ${agent.username}`);
 
-				// Join rooms for any already assigned chats
-				pendingAndAssignedChats.filter(s => s.status === 'assigned' && s.agentId.toString() === agentId)
-				.forEach(s => socket.join(s._id.toString()));
 
-				// Broadcast agent's online status
+				pendingAndAssignedChats.filter(s => s.status === 'assigned' && s.agentIds && s.agentIds.includes(agentId))
+				.forEach(s => {
+					socket.join(s._id.toString());
+					console.log(`[Agent Auth] Agent ${agent.username} joined room ${s._id.toString()} for assigned chat.`);
+				});
+
 				io.to('agents').emit('agent:online_status', {userId: agent.id, isOnline: true, status: agent.status});
+				console.log(`[Agent Auth] Broadcast agent:online_status for ${agent.username}`);
 
 			} else {
-				console.warn(`Attempted authentication for non-existent agent ID: ${agentId}`);
+				console.warn(`[Agent Auth] Attempted authentication for non-existent agent ID: ${agentId}`);
 				socket.emit('auth_error', 'Invalid agent ID');
 			}
 		});
 
 		socket.on('agent:set_status', async ({status}) => {
+			console.log(`[Agent Set Status] Agent ${socket.agentId} attempting to set status to: ${status}`);
 			if (!socket.agentId) return;
 			try {
 				const agent = await User.findByIdAndUpdate(
@@ -280,68 +347,82 @@ module.exports = (io) => {
 				);
 
 				if (agent) {
-					// If agent becomes available and there's a queue, assign a chat
+					console.log(`[Agent Set Status] Agent ${agent.username} status updated in DB to: ${status}`);
 					if (status === 'available' && customerQueue.length > 0) {
-						const nextInQueue = customerQueue.shift(); // Get next customer
+						const nextInQueue = customerQueue.shift();
 						const session = await ChatSession.findById(nextInQueue.sessionId);
+						// Defensive initialization after fetch
+						session.agentIds = session.agentIds || [];
+						session.agentUsernames = session.agentUsernames || [];
 
-						if (session && session.status === 'in_queue') { // Ensure session is still in queue
-							session.agentId = agent._id;
-							session.agentUsername = agent.username;
+						if (session && session.status === 'in_queue') {
+							session.agentIds.push(agent._id);
+							session.agentUsernames.push(agent.username);
 							session.status = 'assigned';
 							await session.save();
+							console.log(`[Agent Set Status] Assigned queued session ${session._id} to agent ${agent.username}`);
+							console.log(`[Agent Set Status] Session agentIds: ${session.agentIds}, agentUsernames: ${session.agentUsernames}`);
 
-							// Update agent's status to chatting in DB
-							await User.findByIdAndUpdate(agent._id, {status: 'chatting'});
 
-							// Notify customer
+							await updateAgentStatusBasedOnChats(io, agent._id);
+
 							const customerSocketId = customerSockets.get(session.customerId);
 							if (customerSocketId) {
 								const customerSock = io.sockets.sockets.get(customerSocketId);
 								if (customerSock) {
 									customerSock.join(session._id.toString());
-									// FIXED: Include customerId in the emitted event
 									customerSock.emit('chat:assigned', {
 										sessionId: session._id,
-										agentName: agent.username,
+										agentNames: session.agentUsernames,
 										customerId: session.customerId
 									});
+									console.log(`[Agent Set Status] Emitted chat:assigned to customer ${session.customerId}`);
 								}
 							}
 
-							// Notify this agent and other agents
-							socket.join(session._id.toString()); // Agent's current socket joins room
+							socket.join(session._id.toString());
 							socket.emit('agent:chat_assigned_to_me', {
 								sessionId: session._id,
 								customerName: session.customerName,
 								topic: session.topic
 							});
-							io.to('agents').emit('agent:queue_updated', {sessionId: session._id, status: 'assigned'}); // Update other agents dashboard
-							io.to('agents').emit('agent:status_updated', {userId: agent._id, status: 'chatting'});
+							console.log(`[Agent Set Status] Emitted agent:chat_assigned_to_me to agent ${agent.username}`);
 
-							console.log(`Assigned queued chat ${session._id} to agent ${agent.username}`);
+							io.to('agents').emit('agent:queue_updated', {sessionId: session._id, status: 'assigned'});
+							console.log(`[Agent Set Status] Broadcast agent:queue_updated`);
+
+							io.to('agents').emit('agent:session_status_changed', {
+								sessionId: session._id,
+								newStatus: 'assigned',
+								agentIds: session.agentIds,
+								agentUsernames: session.agentUsernames
+							});
+							console.log(`[Agent Set Status] Broadcast agent:session_status_changed for session ${session._id}`);
+
 						} else {
-							console.warn(`Queued session ${nextInQueue.sessionId} not found or no longer in queue. Skipping.`);
-							// If session is no longer valid, try to find next available agent for next queue item
-							// (more robust error handling needed here, potentially requeue or remove customer from queue)
+							console.warn(`[Agent Set Status] Queued session ${nextInQueue.sessionId} not found or no longer in queue. Skipping.`);
 						}
 					}
-					// Broadcast status update to all agents
 					io.to('agents').emit('agent:status_updated', {userId: agent._id, status: agent.status});
+					console.log(`[Agent Set Status] Broadcast agent:status_updated for agent ${agent.username}`);
 				}
 			} catch (error) {
-				console.error('Error setting agent status:', error);
+				console.error('[Agent Set Status] Error setting agent status:', error);
 			}
 		});
 
-		// Agent sending message
 		socket.on('agent:message', async ({sessionId, content}) => {
-			if (!socket.agentId) return; // Must have an active agent session
+			console.log(`[Agent Message] Received message for session ${sessionId} from agent ${socket.agentId}: ${content}`);
+			if (!socket.agentId) return;
 
 			try {
 				const chatSession = await ChatSession.findById(sessionId);
-				if (!chatSession || !chatSession.agentId || chatSession.agentId.toString() !== socket.agentId || chatSession.status !== 'assigned') {
-					console.warn(`Agent ${socket.agentId} tried to send message to invalid/unassigned session ${sessionId}`);
+				// Defensive initialization after fetch
+				chatSession.agentIds = chatSession.agentIds || [];
+				chatSession.agentUsernames = chatSession.agentUsernames || [];
+
+				if (!chatSession || !chatSession.agentIds.includes(socket.agentId) || chatSession.status !== 'assigned') {
+					console.warn(`[Agent Message] Agent ${socket.agentId} tried to send message to invalid/unassigned session ${sessionId}`);
 					return;
 				}
 
@@ -352,230 +433,432 @@ module.exports = (io) => {
 					content,
 				});
 				await newMessage.save();
+				console.log(`[Agent Message] Message saved: ${newMessage._id}`);
 
-				// Emit message to everyone in the chat session room (customer and agent)
+
 				io.to(sessionId).emit('chat:message', {
 					sessionId,
 					senderId: socket.agentId,
 					senderRole: 'agent',
 					content,
 					timestamp: newMessage.timestamp,
+					senderUsername: chatSession.agentUsernames[chatSession.agentIds.indexOf(socket.agentId)] // NEW: Include sender's username
 				});
+				console.log(`[Agent Message] Emitted chat:message to room ${sessionId}`);
+
 			} catch (error) {
-				console.error('Error saving agent message:', error);
+				console.error('[Agent Message] Error saving agent message:', error);
 			}
 		});
 
-		// NEW: Agent accepts a pending/in_queue chat from the dashboard
-		socket.on('agent:accept_chat', async ({sessionId}) => {
-			if (!socket.agentId) return; // Must be an authenticated agent
-
-			try {
-				const chatSession = await ChatSession.findById(sessionId);
-
-				// 1. Validate session and status
-				if (!chatSession || (chatSession.status !== 'pending' && chatSession.status !== 'in_queue')) {
-					console.warn(`Agent ${socket.agentId} tried to accept invalid/non-pending session ${sessionId}`);
-					return;
-				}
-
-				// 2. Remove from in-memory queue if it was there
-				const initialQueueLength = customerQueue.length;
-				customerQueue = customerQueue.filter(item => item.sessionId.toString() !== sessionId);
-				if (customerQueue.length < initialQueueLength) {
-					console.log(`Removed session ${sessionId} from in-memory queue upon agent acceptance.`);
-				}
-
-				// 3. Assign agent and update session status in DB
-				chatSession.agentId = socket.agentId;
-				const agent = await User.findById(socket.agentId);
-				if (agent) {
-					chatSession.agentUsername = agent.username;
-				} else {
-					console.error(`Agent ${socket.agentId} not found when accepting chat.`);
-					return;
-				}
-				chatSession.status = 'assigned';
-				await chatSession.save();
-
-				// 4. Update agent's status to 'chatting' in DB
-				await User.findByIdAndUpdate(socket.agentId, {status: 'chatting'});
-				io.to('agents').emit('agent:status_updated', {userId: socket.agentId, status: 'chatting'});
-
-				// 5. Join agent's current socket to the chat session room
-				socket.join(sessionId);
-
-				// 6. Notify the customer
-				const customerSocketId = customerSockets.get(chatSession.customerId);
-				if (customerSocketId) {
-					const customerSock = io.sockets.sockets.get(customerSocketId);
-					if (customerSock) {
-						customerSock.join(sessionId); // Customer's socket joins the room
-						customerSock.emit('chat:assigned', {
-							sessionId: chatSession._id,
-							agentName: chatSession.agentUsername,
-							customerId: chatSession.customerId // Ensure customer gets their ID
-						});
-						console.log(`Customer ${chatSession.customerId} notified of assignment to agent ${agent.username}`);
-					}
-				} else {
-					console.warn(`Customer socket not found for session ${sessionId}. Customer might have disconnected.`);
-				}
-
-				// 7. Broadcast updates to other agents for dashboard
-				io.to('agents').emit('agent:queue_updated', {}); // Signal general queue update
-				io.to('agents').emit('agent:session_status_changed', {
-					sessionId: chatSession._id,
-					newStatus: 'assigned',
-					agentId: chatSession.agentId,
-					agentUsername: chatSession.agentUsername
-				});
-
-				console.log(`Agent ${agent.username} manually accepted chat session ${sessionId}`);
-
-			} catch (error) {
-				console.error('Error accepting chat session by agent:', error);
-			}
-		});
-
-
-		// Agent closes chat session
-		socket.on('agent:close_chat', async (sessionId) => {
+		socket.on('agent:join_chat', async ({sessionId}) => {
+			console.log(`[Agent Join Chat] Agent ${socket.agentId} attempting to join session ${sessionId}`);
 			if (!socket.agentId) return;
 
 			try {
 				const chatSession = await ChatSession.findById(sessionId);
-				// FIXED: Added null check for chatSession.agentId
-				if (!chatSession || !chatSession.agentId || chatSession.agentId.toString() !== socket.agentId || chatSession.status === 'closed') {
-					console.warn(`Agent ${socket.agentId} tried to close invalid/already closed session ${sessionId} or not assigned.`);
+				if (!chatSession) {
+					console.warn(`[Agent Join Chat] Agent ${socket.agentId} tried to join non-existent session ${sessionId}`);
+					return;
+				}
+
+				// Defensive initialization after fetch
+				chatSession.agentIds = chatSession.agentIds || [];
+				chatSession.agentUsernames = chatSession.agentUsernames || [];
+				console.log(`[Agent Join Chat] Session ${sessionId} current agentIds: ${chatSession.agentIds}, agentUsernames: ${chatSession.agentUsernames}`);
+
+
+				if (chatSession.status === 'pending' || chatSession.status === 'in_queue') {
+					const initialQueueLength = customerQueue.length;
+					customerQueue = customerQueue.filter(item => item.sessionId.toString() !== sessionId);
+					if (customerQueue.length < initialQueueLength) {
+						console.log(`[Agent Join Chat] Removed session ${sessionId} from in-memory queue upon agent join.`);
+					}
+
+					const agent = await User.findById(socket.agentId);
+					if (!agent) {
+						console.error(`[Agent Join Chat] Agent ${socket.agentId} not found when joining chat.`);
+						return;
+					}
+
+					chatSession.agentIds.push(agent._id);
+					chatSession.agentUsernames.push(agent.username);
+					chatSession.status = 'assigned';
+					await chatSession.save();
+					console.log(`[Agent Join Chat] Session ${sessionId} status updated to assigned by agent ${agent.username}.`);
+					console.log(`[Agent Join Chat] Session agentIds after push: ${chatSession.agentIds}, agentUsernames: ${chatSession.agentUsernames}`);
+
+					console.log("***********")
+					await updateAgentStatusBasedOnChats(io, socket.agentId);
+					console.log("^^^^^^^^^^^^^^^")
+					const customerSocketId = customerSockets.get(chatSession.customerId);
+					console.log("@@@@@@@@@@@@@")
+					if (customerSocketId) {
+						const customerSock = io.sockets.sockets.get(customerSocketId);
+						if (customerSock) {
+							customerSock.join(sessionId);
+							customerSock.emit('chat:assigned', {
+								sessionId: chatSession._id,
+								agentNames: chatSession.agentUsernames,
+								customerId: chatSession.customerId
+							});
+							console.log(`Customer ${chatSession.customerId} notified of assignment to agent ${agent.username}`);
+						}
+					}
+					io.to('agents').emit('agent:queue_updated', {});
+					io.to('agents').emit('agent:session_status_changed', {
+						sessionId: chatSession._id,
+						newStatus: 'assigned',
+						agentIds: chatSession.agentIds,
+						agentUsernames: chatSession.agentUsernames
+					});
+					console.log(`[Agent Join Chat] Broadcast agent:session_status_changed for session ${sessionId}`);
+
+				} else if (chatSession.status === 'assigned') {
+					if (!chatSession.agentIds.includes(socket.agentId)) {
+						const agent = await User.findById(socket.agentId);
+						if (!agent) {
+							console.error(`[Agent Join Chat] Agent ${socket.agentId} not found when joining active chat.`);
+							return;
+						}
+
+						chatSession.agentIds.push(agent._id);
+						chatSession.agentUsernames.push(agent.username);
+						await chatSession.save();
+						console.log(`[Agent Join Chat] Agent ${agent.username} added to existing session ${sessionId}.`);
+						console.log(`[Agent Join Chat] Session agentIds after push: ${chatSession.agentIds}, agentUsernames: ${chatSession.agentUsernames}`);
+
+						await updateAgentStatusBasedOnChats(io, socket.agentId);
+
+						io.to(sessionId).emit('chat:agent_joined', {
+							sessionId: chatSession._id,
+							agentId: agent._id,
+							agentUsername: agent.username,
+							allAgentNames: chatSession.agentUsernames
+						});
+						console.log(`[Agent Join Chat] Emitted chat:agent_joined to room ${sessionId}`);
+
+						io.to('agents').emit('agent:session_status_changed', {
+							sessionId: chatSession._id,
+							newStatus: 'assigned',
+							agentIds: chatSession.agentIds,
+							agentUsernames: chatSession.agentUsernames
+						});
+						console.log(`[Agent Join Chat] Broadcast agent:session_status_changed for session ${chatSession._id}`);
+
+					} else {
+						console.log(`[Agent Join Chat] Agent ${socket.agentId} already in session ${sessionId}.`);
+					}
+				}
+
+				socket.join(sessionId);
+				console.log(`[Agent Join Chat] Agent socket ${socket.id} joined room ${sessionId}.`);
+
+			} catch (error) {
+				console.error('[Agent Join Chat] Error agent joining chat session:', error);
+			}
+		});
+
+		socket.on('agent:invite_agent', async ({sessionId, invitedAgentId}) => {
+			console.log(`[Agent Invite] Agent ${socket.agentId} inviting ${invitedAgentId} to session ${sessionId}`);
+			if (!socket.agentId) return;
+			if (!invitedAgentId) {
+				console.warn(`[Agent Invite] Agent ${socket.agentId} tried to invite without invitedAgentId.`);
+				return;
+			}
+
+			try {
+				const chatSession = await ChatSession.findById(sessionId);
+				// Defensive initialization after fetch
+				chatSession.agentIds = chatSession.agentIds || [];
+				chatSession.agentUsernames = chatSession.agentUsernames || [];
+
+				if (!chatSession || chatSession.status !== 'assigned' || !chatSession.agentIds.includes(socket.agentId)) {
+					console.warn(`[Agent Invite] Agent ${socket.agentId} tried to invite to invalid/unassigned/non-active session ${sessionId}.`);
+					return;
+				}
+
+				if (chatSession.agentIds.includes(invitedAgentId)) {
+					console.log(`[Agent Invite] Invited agent ${invitedAgentId} is already in session ${sessionId}. Skipping.`);
+					return;
+				}
+
+				const invitedAgentUser = await User.findById(invitedAgentId);
+				if (!invitedAgentUser || invitedAgentUser.role !== 'agent') {
+					console.warn(`[Agent Invite] Invited ID ${invitedAgentId} is not a valid agent.`);
+					return;
+				}
+
+				chatSession.agentIds.push(invitedAgentUser._id);
+				chatSession.agentUsernames.push(invitedAgentUser.username);
+				await chatSession.save();
+				console.log(`[Agent Invite] Invited agent ${invitedAgentUser.username} added to session ${sessionId}.`);
+				console.log(`[Agent Invite] Session agentIds after push: ${chatSession.agentIds}, agentUsernames: ${chatSession.agentUsernames}`);
+
+
+				await updateAgentStatusBasedOnChats(io, invitedAgentUser._id);
+
+				if (agentSockets.has(invitedAgentId)) {
+					agentSockets.get(invitedAgentId).forEach(agentSocketId => {
+						io.sockets.sockets.get(agentSocketId)?.join(sessionId);
+						console.log(`[Agent Invite] Invited agent socket ${agentSocketId} joined room ${sessionId}.`);
+						// NEW: Explicitly notify the invited agent's specific sockets
+						io.to(agentSocketId).emit('agent:you_were_invited', {
+							sessionId: chatSession._id,
+							customerName: chatSession.customerName,
+							topic: chatSession.topic,
+							invitingAgentUsername: (async () => { // Wrapped in an async IIFE
+								const invitingAgent = await User.findById(socket.agentId);
+								return invitingAgent?.username || 'Another Agent';
+							})()
+						});
+						console.log(`[Agent Invite] Emitted agent:you_were_invited to invited agent socket ${agentSocketId}`);
+					});
+				}
+
+				io.to(sessionId).emit('chat:agent_joined', {
+					sessionId: chatSession._id,
+					agentId: invitedAgentUser._id,
+					agentUsername: invitedAgentUser.username,
+					allAgentNames: chatSession.agentUsernames
+				});
+				console.log(`[Agent Invite] Emitted chat:agent_joined to room ${sessionId}`);
+
+				io.to('agents').emit('agent:session_status_changed', {
+					sessionId: chatSession._id,
+					newStatus: 'assigned',
+					agentIds: chatSession.agentIds,
+					agentUsernames: chatSession.agentUsernames
+				});
+				console.log(`[Agent Invite] Broadcast agent:session_status_changed for session ${chatSession._id}`);
+
+				console.log(`Agent ${invitedAgentUser.username} invited to session ${sessionId} by ${socket.agentId}.`);
+
+			} catch (error) {
+				console.error('[Agent Invite] Error inviting agent to chat session:', error);
+			}
+		});
+
+		socket.on('agent:leave_chat', async ({sessionId}) => {
+			console.log(`[Agent Leave Chat] Agent ${socket.agentId} attempting to leave session ${sessionId}`);
+			if (!socket.agentId) return;
+
+			try {
+				const chatSession = await ChatSession.findById(sessionId);
+				if (!chatSession || chatSession.status === 'closed') {
+					console.warn(`[Agent Leave Chat] Agent ${socket.agentId} tried to leave invalid/closed session ${sessionId}`);
+					return;
+				}
+
+				// Defensive initialization after fetch
+				chatSession.agentIds = chatSession.agentIds || [];
+				chatSession.agentUsernames = chatSession.agentUsernames || [];
+				console.log(`[Agent Leave Chat] Session ${sessionId} current agentIds: ${chatSession.agentIds}, agentUsernames: ${chatSession.agentUsernames}`);
+
+
+				const agentIndex = chatSession.agentIds.indexOf(socket.agentId);
+				let leavingAgentUsername = 'Unknown Agent';
+				if (agentIndex > -1) {
+					leavingAgentUsername = chatSession.agentUsernames[agentIndex];
+					chatSession.agentIds.splice(agentIndex, 1);
+					chatSession.agentUsernames.splice(agentIndex, 1);
+				} else {
+					console.warn(`[Agent Leave Chat] Agent ${socket.agentId} not found in session ${sessionId} to leave.`);
+					return;
+				}
+				console.log(`[Agent Leave Chat] Session agentIds after splice: ${chatSession.agentIds}, agentUsernames: ${chatSession.agentUsernames}`);
+
+
+				if (chatSession.agentIds.length === 0) {
+					chatSession.status = 'closed';
+					chatSession.endedAt = Date.now();
+					await chatSession.save();
+					console.log(`[Agent Leave Chat] Session ${sessionId} closed as last agent left.`);
+
+					const socketsInRoom = await io.in(sessionId).fetchSockets();
+					socketsInRoom.forEach(s => {
+						s.leave(sessionId);
+						s.emit('chat:session_closed', {sessionId: sessionId, reason: 'agent_left_last'});
+					});
+					io.to('agents').emit('agent:session_closed_broadcast', {sessionId: sessionId});
+					customerSockets.delete(chatSession.customerId);
+					console.log(`Chat session ${sessionId} closed due to last agent (${socket.agentId}) disconnect.`);
+
+				} else {
+					await chatSession.save();
+					console.log(`[Agent Leave Chat] Session ${sessionId} updated after agent left.`);
+					io.to(sessionId).emit('chat:agent_left', {
+						sessionId: chatSession._id,
+						agentId: socket.agentId,
+						agentUsername: leavingAgentUsername,
+						allAgentNames: chatSession.agentUsernames
+					});
+					console.log(`[Agent Leave Chat] Emitted chat:agent_left to room ${sessionId}`);
+
+					io.to('agents').emit('agent:session_status_changed', {
+						sessionId: chatSession._id,
+						newStatus: 'assigned',
+						agentIds: chatSession.agentIds,
+						agentUsernames: chatSession.agentUsernames
+					});
+					console.log(`[Agent Leave Chat] Broadcast agent:session_status_changed for session ${chatSession._id}`);
+
+				}
+
+				socket.leave(sessionId);
+				console.log(`[Agent Leave Chat] Agent socket ${socket.id} left room ${sessionId}.`);
+				await updateAgentStatusBasedOnChats(io, socket.agentId);
+
+			} catch (error) {
+				console.error('[Agent Leave Chat] Error agent leaving chat session:', error);
+			}
+		});
+
+
+		socket.on('agent:close_chat', async (sessionId) => {
+			console.log(`[Agent Close Chat] Agent ${socket.agentId} attempting to close session ${sessionId}`);
+			if (!socket.agentId) return;
+
+			try {
+				const chatSession = await ChatSession.findById(sessionId);
+				// Defensive initialization after fetch
+				chatSession.agentIds = chatSession.agentIds || [];
+				chatSession.agentUsernames = chatSession.agentUsernames || [];
+
+				if (!chatSession || !chatSession.agentIds.includes(socket.agentId) || chatSession.status === 'closed') {
+					console.warn(`[Agent Close Chat] Agent ${socket.agentId} tried to close invalid/already closed session ${sessionId} or not assigned.`);
 					return;
 				}
 
 				chatSession.status = 'closed';
 				chatSession.endedAt = Date.now();
 				await chatSession.save();
+				console.log(`[Agent Close Chat] Session ${sessionId} status updated to closed.`);
 
-				// FIXED: Use fetchSockets() to get actual socket objects in the room
-				const socketsInRoom = await io.in(sessionId).fetchSockets(); // Use io.in(room).fetchSockets()
+
+				const socketsInRoom = await io.in(sessionId).fetchSockets();
 				socketsInRoom.forEach(s => {
 					s.leave(sessionId);
-					s.emit('chat:session_closed', {sessionId: sessionId, reason: 'agent_closed'}); // Notify both customer and agent
+					s.emit('chat:session_closed', {sessionId: sessionId, reason: 'agent_closed'});
 				});
+				console.log(`[Agent Close Chat] Emitted chat:session_closed to room ${sessionId}`);
 
-				// Update agent's status if they are not active in other chats
-				const activeAssignedChats = await ChatSession.countDocuments({
-					agentId: socket.agentId,
-					status: 'assigned'
-				});
 
-				if (activeAssignedChats === 0) { // If no more active chats, set agent to available
-					await User.findByIdAndUpdate(socket.agentId, {status: 'available'});
-					io.to('agents').emit('agent:status_updated', {userId: socket.agentId, status: 'available'});
-					// If agent was 'chatting' and now has no chats, they go back to 'available'
-				} else {
-					// Agent still chatting in other sessions, status remains 'chatting'
-					// This broadcast ensures consistency for other agents viewing their status
-					io.to('agents').emit('agent:status_updated', {userId: socket.agentId, status: 'chatting'});
+				for (const agentId of chatSession.agentIds) {
+					await updateAgentStatusBasedOnChats(io, agentId);
 				}
 
-				// Remove customer's socket mapping if it was based on this session
 				customerSockets.delete(chatSession.customerId);
 
 				console.log(`Chat session ${sessionId} closed by agent ${socket.agentId}`);
-				// Inform other agents about the closed session (e.g., remove from their dashboard)
 				io.to('agents').emit('agent:session_closed_broadcast', {sessionId: sessionId});
+				console.log(`[Agent Close Chat] Broadcast agent:session_closed_broadcast for ${sessionId}`);
 
 			} catch (error) {
-				console.error('Error closing chat session:', error);
+				console.error('[Agent Close Chat] Error closing chat session:', error);
 			}
 		});
 
 
 		// --- Disconnection Handling ---
 		socket.on('disconnect', async () => {
-			console.log(`Disconnected: ${socket.id}`);
+			console.log(`[Disconnect] Disconnected: ${socket.id}`);
 
-			// Handle customer disconnect
 			if (socket.customerId) {
-				console.log(`Customer ${socket.customerId} disconnected.`);
-				// If customer was in queue, remove them
+				console.log(`[Disconnect] Customer ${socket.customerId} disconnected.`);
 				const initialQueueLength = customerQueue.length;
-				customerQueue = customerQueue.filter(item => item.customerSocketId !== socket.id);
+				customerQueue = customerQueue.filter(item => item.sessionId.toString() !== socket.id); // FIXED: Filter by sessionId
 				if (customerQueue.length < initialQueueLength) {
-					io.to('agents').emit('agent:queue_updated', {}); // Notify agents queue changed
-					console.log(`Customer ${socket.customerId} removed from in-memory queue on disconnect.`);
+					io.to('agents').emit('agent:queue_updated', {});
+					console.log(`[Disconnect] Broadcast agent:queue_updated`);
 				}
 
-				// If customer was in an active assigned chat, update session status (mark as abandoned)
 				const activeSession = await ChatSession.findOne({customerId: socket.customerId, status: 'assigned'});
+				// FIXED: Check if activeSession is not null before accessing its properties
 				if (activeSession) {
-					activeSession.status = 'closed'; // Mark as closed due to disconnect
+					// Defensive initialization after fetch
+					activeSession.agentIds = activeSession.agentIds || [];
+					activeSession.agentUsernames = activeSession.agentUsernames || [];
+
+					activeSession.status = 'closed';
 					activeSession.endedAt = Date.now();
 					await activeSession.save();
-					console.log(`Chat session ${activeSession._id} closed due to customer disconnect.`);
-					// Notify agent in that session
+					console.log(`[Disconnect] Session ${activeSession._id} closed due to customer disconnect.`);
+
 					io.to(activeSession._id.toString()).emit('chat:session_closed', {
 						sessionId: activeSession._id,
 						reason: 'customer_disconnected'
 					});
 					io.to('agents').emit('agent:session_closed_broadcast', {sessionId: activeSession._id});
+					console.log(`[Disconnect] Emitted chat:session_closed and agent:session_closed_broadcast for ${activeSession._id}`);
 
-					// Update agent's status if they were only chatting with this customer
-					const activeAssignedChats = await ChatSession.countDocuments({
-						agentId: activeSession.agentId,
-						status: 'assigned'
-					});
-					if (activeAssignedChats === 0 && activeSession.agentId) { // Only change status if no other active chats
-						await User.findByIdAndUpdate(activeSession.agentId, {status: 'available'});
-						io.to('agents').emit('agent:status_updated', {
-							userId: activeSession.agentId,
-							status: 'available'
-						});
-					} else if (activeSession.agentId) {
-						io.to('agents').emit('agent:status_updated', {
-							userId: activeSession.agentId,
-							status: 'chatting'
-						});
+
+					for (const agentId of activeSession.agentIds) {
+						await updateAgentStatusBasedOnChats(io, agentId);
 					}
 				}
-				customerSockets.delete(socket.customerId); // Remove customer from active map
+				customerSockets.delete(socket.customerId);
 			}
 
-			// Handle agent disconnect
 			if (socket.agentId) {
-				console.log(`Agent ${socket.agentId} disconnected.`);
+				console.log(`[Disconnect] Agent ${socket.agentId} disconnected.`);
 				if (agentSockets.has(socket.agentId)) {
 					agentSockets.get(socket.agentId).delete(socket.id);
 
-					// If no more sockets for this agent, mark them offline in DB and broadcast
 					if (agentSockets.get(socket.agentId).size === 0) {
 						agentSockets.delete(socket.agentId);
-						// Set agent's status to unavailable and offline in DB
 						await User.findByIdAndUpdate(socket.agentId, {isOnline: false, status: 'unavailable'});
 						io.to('agents').emit('agent:online_status', {
 							userId: socket.agentId,
 							isOnline: false,
 							status: 'unavailable'
 						});
-						console.log(`Agent ${socket.agentId} is now truly offline.`);
+						console.log(`[Disconnect] Agent ${socket.agentId} is now truly offline.`);
 
-						// If agent had assigned chats, re-queue them or mark as abandoned (more complex logic needed)
-						// For simplicity, we'll just close them for now.
-						const assignedChats = await ChatSession.find({agentId: socket.agentId, status: 'assigned'});
-						for (const session of assignedChats) {
-							session.status = 'closed';
-							session.endedAt = Date.now();
-							await session.save();
-							io.to(session._id.toString()).emit('chat:session_closed', {
-								sessionId: session._id,
-								reason: 'agent_disconnected'
-							});
-							io.to('agents').emit('agent:session_closed_broadcast', {sessionId: session._id});
-							console.log(`Session ${session._id} closed due to agent disconnect.`);
+						const assignedChats = await ChatSession.find({agentIds: socket.agentId, status: 'assigned'});
+						// FIXED: Check if session is not null before accessing its properties
+						for (const assignedChat of assignedChats) { // Renamed loop variable to assignedChat
+							// Defensive initialization after fetch
+							assignedChat.agentIds = assignedChat.agentIds || [];
+							assignedChat.agentUsernames = assignedChat.agentUsernames || [];
+
+							const agentIndex = assignedChat.agentIds.indexOf(socket.agentId);
+							if (agentIndex > -1) {
+								assignedChat.agentIds.splice(agentIndex, 1);
+								assignedChat.agentUsernames.splice(agentIndex, 1);
+							}
+
+							if (assignedChat.agentIds.length === 0) {
+								assignedChat.status = 'closed';
+								assignedChat.endedAt = Date.now();
+								await assignedChat.save();
+								io.to(assignedChat._id.toString()).emit('chat:session_closed', {
+									sessionId: assignedChat._id,
+									reason: 'agent_disconnected_last'
+								});
+								io.to('agents').emit('agent:session_closed_broadcast', {sessionId: assignedChat._id});
+								customerSockets.delete(assignedChat.customerId);
+								console.log(`[Disconnect] Session ${assignedChat._id} closed due to last agent (${socket.agentId}) disconnect.`);
+							} else {
+								await assignedChat.save();
+								io.to(assignedChat._id.toString()).emit('chat:agent_left', {
+									sessionId: assignedChat._id,
+									agentId: socket.agentId,
+									agentUsername: 'Disconnected Agent',
+									allAgentNames: assignedChat.agentUsernames
+								});
+								io.to('agents').emit('agent:session_status_changed', {
+									sessionId: assignedChat._id,
+									newStatus: 'assigned',
+									agentIds: assignedChat.agentIds,
+									agentUsernames: assignedChat.agentUsernames
+								});
+								console.log(`Agent ${socket.agentId} disconnected from session ${assignedChat._id}. Other agents remaining.`);
+							}
 						}
 					}
 				}
 			}
 		});
 	});
-}
+};
