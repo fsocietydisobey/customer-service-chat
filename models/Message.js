@@ -6,6 +6,7 @@ const MessageSchema = new mongoose.Schema({
 		type: mongoose.Schema.Types.ObjectId,
 		ref: 'ChatSession',
 		required: true,
+		index: true // Add index for efficient lookups
 	},
 	senderId: { // ID of the sender (can be customerId or agentId)
 		type: String, // Using String because customerId is String
@@ -25,5 +26,8 @@ const MessageSchema = new mongoose.Schema({
 		default: Date.now,
 	},
 });
+
+// Add a compound index for efficient retrieval of messages within a chat session, ordered by time
+MessageSchema.index({ chatSession: 1, timestamp: 1 });
 
 module.exports = mongoose.model('Message', MessageSchema);
