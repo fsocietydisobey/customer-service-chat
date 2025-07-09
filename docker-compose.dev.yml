@@ -1,0 +1,29 @@
+# docker-compose.dev.yml (Development environment overrides)
+
+services:
+  mongodb:
+    image: mongo:latest
+    container_name: chat-mongodb-dev
+    ports:
+      - "27017:27017" # Map container port 27017 to host port 27017
+    volumes:
+      - mongodb_data_dev:/data/db # Use a dev-specific named volume
+    environment:
+      # No auth for simplicity in development (for now)
+      MONGO_URI: mongodb://mongodb:27017/customer_service_chat_dev # Use a dev-specific DB name
+
+  app:
+    # Build context and Dockerfile can remain common if your Dockerfile is multi-stage or generic
+    # If you need dev-specific build steps, you can define build here.
+    build:
+      context: .
+      dockerfile: Dockerfile # Assumes your Dockerfile supports both
+    volumes:
+      - .:/app # Mount host code for live reloading
+      - /app/node_modules # Hide host node_modules
+    environment:
+      MONGO_URI: mongodb://mongodb:27017/customer_service_chat_dev # App connects to the local dev MongoDB
+      JWT_SECRET: your_super_secret_jwt_key_for_agents # <--- **DEFINED HERE**      NODE_ENV: development # Set environment for your app
+      DEBUG: 'true' # Enable debugging
+volumes:
+  mongodb_data_dev: # Define the dev-specific named volume

@@ -1,0 +1,52 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml # Promtail uses this to track what it has already read
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push # Point to the Loki service in the same Docker network
+
+scrape_configs:
+  - job_name: containerlogs # A logical job name for your container logs
+    docker_sd_configs: # Use Docker Service Discovery to find containers
+      - host: unix:///var/run/docker.sock
+        # Filters:
+        # - Optional: Use `filters` to include/exclude specific containers
+        # - filter:
+        #     name: container # Filter by container name regex
+        #     values: ['chat-app-prod'] # Only collect logs from your app container
+    relabel_configs: # Extract labels from Docker metadata
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)' # Capture container name
+        target_label: 'container' # Rename to 'container' label
+      - source_labels: ['__meta_docker_container_name']
+        regex: 'chat-app-prod' # Specific to your app
+        target_label: 'app' # Add a label to filter your app logs easily
+      - source_labels: ['__meta_docker_container_id']
+        target_label: 'instance' # Add container ID as an instance label
+      - source_labels: ['__meta_docker_image_name']
+        regex: '.*/(.*)' # Extract image name without registry
+        target_label: 'image'
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: 'compose_service' # Label for Docker Compose service name
+
+    pipeline_stages:
+      - json:
+          expressions:
+            level: level # Extract 'level' field from JSON log
+            ts: time     # Extract 'time' field for timestamp
+            message: msg # Extract 'msg' field for the main log message
+            # Add more fields if your Pino output contains them, e.g.,
+            # service: service
+            # env: env
+            # userId: userId
+      - labels:
+          level: # Promote 'level' from log content to a Loki label
+          # Add more labels you want to filter by, e.g.,
+          # service:
+          # env:
+      - output:
+          source: message # Set the 'message' field as the primary log line
+          # If your JSON logs contain a 'msg' field, this will be the line in Grafana.

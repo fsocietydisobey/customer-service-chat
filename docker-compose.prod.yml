@@ -1,0 +1,27 @@
+# docker-compose.prod.yml (Production environment overrides)
+
+services:
+  app:
+    # For production, you'd usually have a pre-built image, not build on the fly.
+    # So, remove `build: .` and just use `image:`
+    # build: . # REMOVE THIS FOR PRODUCTION - image should be pre-built
+    image: fsocietydisobey/customer-chat-app:v1.0 # Your production image tag
+    volumes:
+    # In production, you typically don't mount host code; code is baked into the image.
+    # So, remove the .:/app volume mount.
+    # /app/node_modules is also not needed as it's part of the image.
+    # You might add a volume for logs if your app writes to local files.
+    environment:
+      # *** VERY IMPORTANT: Replace with actual production credentials and URI ***
+      MONGO_URI: ${PROD_MONGO_URI} # Use an environment variable for sensitive URI
+      JWT_SECRET: ${PROD_JWT_SECRET} # Use an environment variable for sensitive secret
+      PORT: 80 # Often apps listen on 80/443 in production behind a proxy
+      NODE_ENV: production
+      DEBUG: 'false' # Disable debugging
+
+    # No 'mongodb' service definition here because it's an external service.
+    # The 'depends_on' for mongodb might be removed or set to a dummy service if needed
+    # for strict Compose ordering, but generally, your app should handle connection retries
+    # for external services.
+
+# No volumes for MongoDB data as it's an external service

@@ -1,0 +1,36 @@
+auth_enabled: false # IMPORTANT: Set to true and configure authentication for production!
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+
+common:
+  path_prefix: /loki/chunks # Matches the volume mount point for Loki data
+  replication_factor: 1
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory # For single-node setup, inmemory is fine
+
+schema_config:
+  configs:
+    - from: 2020-10-27
+      store: boltdb-shipper
+      object_store: filesystem
+      schema: v11
+      ruler_storage:
+        type: local
+        local:
+          directory: /loki/rules # Matches the volume mount point for Loki data
+      index:
+        prefix: index_
+        period: 24h
+
+# This configuration uses the filesystem for storing chunks (log data) and index
+storage_config:
+  boltdb_shipper:
+    active_index_directory: /loki/boltdb-shipper-active
+    cache_location: /loki/boltdb-shipper-cache
+    shared_store: filesystem
+  filesystem:
+    directory: /loki/chunks # This directory will be mounted by 'loki_data' volume

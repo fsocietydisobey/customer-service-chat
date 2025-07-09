@@ -1,0 +1,54 @@
+# docker-compose.loki.yml
+version: '3.8'
+
+services:
+  # Loki (Log Store)
+  loki:
+    image: grafana/loki:2.9.0 # Use a specific stable version
+    container_name: loki
+    command: -config.file=/etc/loki/local-config.yaml # Mount your config
+    volumes:
+      - ./loki/local-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki # Persist Loki data here (default /tmp/loki, changing to /loki)
+    ports:
+      - "3100:3100" # Loki's API port
+    restart: unless-stopped # Ensure it restarts if it crashes
+
+  # Promtail (Log Shipper)
+  promtail:
+    image: grafana/promtail:2.9.0 # Use a specific stable version
+    container_name: promtail
+    command: -config.file=/etc/promtail/config.yaml # Mount your config
+    volumes:
+      - ./promtail/config.yaml:/etc/promtail/config.yaml:ro
+      # Bind mounts to allow Promtail to read Docker logs from the host
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro # Docker container log files
+      - /var/run/docker.sock:/var/run/docker.sock:ro # For Docker discovery (optional, but good for labels)
+      # /var/log is often too broad, /var/lib/docker/containers is more specific for Docker logs
+    depends_on:
+      - loki # Ensure Loki is up before Promtail tries to send logs
+    restart: unless-stopped # Ensure it restarts if it crashes
+
+  # Grafana (Visualization UI)
+  grafana:
+    image: grafana/grafana:10.4.1 # Use a specific stable version
+    container_name: grafana
+    volumes:
+      - grafana_data:/var/lib/grafana # Persist Grafana data (dashboards, settings)
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources # Configure Loki datasource automatically
+    ports:
+      - "3000:3000" # Access Grafana on host port 3000
+    environment:
+      # IMPORTANT: In production, configure strong authentication for Grafana
+      # - GF_AUTH_ANONYMOUS_ENABLED=true # Disable this for production!
+      # - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_SECURITY_ADMIN_USER=admin # CHANGE THIS!
+      - GF_SECURITY_ADMIN_PASSWORD=your_strong_admin_password # CHANGE THIS!
+      - GF_SERVER_ROOT_URL=http://localhost:3000 # Or your domain name
+    depends_on:
+      - loki # Grafana needs Loki to query logs
+    restart: unless-stopped # Ensure it restarts if it crashes
+
+volumes:
+  loki_data: # Define named volume for Loki data
+  grafana_data: # Define named volume for Grafana data
